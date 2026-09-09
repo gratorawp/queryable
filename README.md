@@ -9,13 +9,13 @@ The package is not on Packagist, so point Composer at the repository first:
 ```json
 {
     "repositories": [
-        { "type": "vcs", "url": "https://github.com/fundkitorg/queryable.git" }
+        { "type": "vcs", "url": "https://github.com/gratorawp/queryable.git" }
     ]
 }
 ```
 
 ```bash
-composer require fundkit/queryable
+composer require gratora/queryable
 ```
 
 

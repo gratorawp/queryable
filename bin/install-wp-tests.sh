@@ -14,7 +14,7 @@
 #   bin/install-wp-tests.sh wordpress_test root '' 127.0.0.1 latest
 #
 # Override locations with WP_CORE_DIR / WP_TESTS_DIR, which default to the
-# shared install every FundKit repo on the machine looks for.
+# shared install every Gratora repo on the machine looks for.
 set -euo pipefail
 
 DB_NAME=${1:-wordpress_test}
@@ -23,8 +23,8 @@ DB_PASS=${3:-}
 DB_HOST=${4:-127.0.0.1}
 WP_VERSION=${5:-latest}
 
-WP_CORE_DIR=${WP_CORE_DIR:-$HOME/.fundkit-wp-tests/wordpress}
-WP_TESTS_DIR=${WP_TESTS_DIR:-$HOME/.fundkit-wp-tests/wordpress-tests-lib}
+WP_CORE_DIR=${WP_CORE_DIR:-$HOME/.gratora-wp-tests/wordpress}
+WP_TESTS_DIR=${WP_TESTS_DIR:-$HOME/.gratora-wp-tests/wordpress-tests-lib}
 
 # 1. WordPress core
 if [ ! -f "${WP_CORE_DIR}/wp-load.php" ]; then

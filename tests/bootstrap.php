@@ -8,7 +8,7 @@
 $wpTestsDir = getenv('WP_TESTS_DIR') ?: (static function (): string {
     $home       = getenv('HOME') ?: '';
     $candidates = array_filter([
-        $home !== '' ? $home . '/.fundkit-wp-tests/wordpress-tests-lib' : null,
+        $home !== '' ? $home . '/.gratora-wp-tests/wordpress-tests-lib' : null,
         rtrim(getenv('TMPDIR') ?: '/tmp', '/') . '/wordpress-tests-lib',
         '/tmp/wordpress-tests-lib',
     ]);
