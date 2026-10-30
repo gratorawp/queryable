@@ -27,7 +27,7 @@ $phpunitDir = getenv('WP_PHPUNIT__DIR') ?: dirname(__DIR__) . '/vendor/wp-phpuni
 $haveConfig    = file_exists($wpTestsDir . '/wp-tests-config.php');
 $haveFramework = file_exists($phpunitDir . '/includes/functions.php');
 
-if ($haveConfig && $haveFramework) {
+if ($haveConfig && $haveFramework && getenv('QUERYABLE_NO_WP') !== '1') {
     define('WP_TESTS_PHPUNIT_POLYFILLS_PATH', dirname(__DIR__) . '/vendor/yoast/phpunit-polyfills');
 
     if (! defined('WP_TESTS_CONFIG_FILE_PATH')) {

@@ -2,6 +2,8 @@
 
 namespace Queryable\Schema;
 
+use InvalidArgumentException;
+
 /**
  * Defines table columns for migrations
  */
@@ -12,6 +14,9 @@ class Table
     private array $relations = [];
     private array $indexes = [];
     private array $compositeUniques = [];
+    private array $compositePrimary = [];
+    private ?string $rowFormat = null;
+    private ?string $engine = null;
     private string $charset;
     private string $collate;
 
@@ -34,6 +39,22 @@ class Table
     public function string(string $name, int $length = 255): Column
     {
         $col = new Column($name, "VARCHAR({$length})");
+        $this->columns[] = $col;
+
+        return $col;
+    }
+
+    public function char(string $name, int $length = 255): Column
+    {
+        $col = new Column($name, "CHAR({$length})");
+        $this->columns[] = $col;
+
+        return $col;
+    }
+
+    public function binary(string $name, int $length = 16): Column
+    {
+        $col = new Column($name, "BINARY({$length})");
         $this->columns[] = $col;
 
         return $col;
@@ -71,9 +92,22 @@ class Table
         return $col;
     }
 
-    public function tinyInteger(string $name): Column
+    public function smallInteger(string $name): Column
     {
-        $col = new Column($name, 'TINYINT');
+        $col = new Column($name, 'SMALLINT');
+        $this->columns[] = $col;
+
+        return $col;
+    }
+
+    /**
+     * A width is only ever a display hint, never a range, but tinyint(1) is the
+     * one clients read as boolean, so a column that means true or false has to
+     * be able to say so.
+     */
+    public function tinyInteger(string $name, ?int $length = null): Column
+    {
+        $col = new Column($name, $length === null ? 'TINYINT' : "TINYINT({$length})");
         $this->columns[] = $col;
 
         return $col;
@@ -216,6 +250,48 @@ class Table
     }
 
     /**
+     * A table may carry one PRIMARY KEY, so declaring a composite one suppresses
+     * every column-level primary() (id() sets one implicitly). Two PRIMARY KEY
+     * clauses in one CREATE TABLE is MySQL error 1068, and dbDelta cannot drop a
+     * primary key afterwards, so the first install is the only chance to get it
+     * right.
+     */
+    public function primary(array $columns): static
+    {
+        $known = array_map(fn (Column $c): string => $c->getDefinition()['name'], $this->columns);
+
+        foreach ($columns as $col) {
+            if (!in_array($col, $known, true)) {
+                throw new InvalidArgumentException("Unknown column in primary key: {$col}");
+            }
+        }
+
+        $this->compositePrimary = $columns;
+
+        return $this;
+    }
+
+    /**
+     * DYNAMIC is what raises the index key limit from 767 to 3072 bytes. InnoDB
+     * defaults to it on MySQL 5.7+, but declaring it is what makes the limit
+     * true on an install whose innodb_default_row_format was changed.
+     */
+    public function rowFormat(string $format): static
+    {
+        $this->rowFormat = strtoupper($format);
+
+        return $this;
+    }
+
+    public function collation(string $charset, string $collate): static
+    {
+        $this->charset = $charset;
+        $this->collate = $collate;
+
+        return $this;
+    }
+
+    /**
      * Backtick-quote a column identifier so a reserved-word column name (e.g.
      * `trigger`, `cursor`) still compiles to valid DDL. Embedded backticks are
      * escaped by doubling, the standard MySQL escape.
@@ -270,6 +346,38 @@ class Table
         return $base . $args;
     }
 
+    /**
+     * Left undeclared, a table takes the server's default_storage_engine. On a server where that is
+     * MyISAM a table silently loses transactions and crash safety, or fails outright on the 1000-byte
+     * index key ceiling, and dbDelta ignores everything outside the parentheses so a later CREATE
+     * cannot repair it, so a table that relies on either says so here.
+     */
+    public function engine(string $engine): static
+    {
+        $this->engine = $engine;
+
+        return $this;
+    }
+
+    private function tableOptions(): string
+    {
+        if ($this->engine === null && $this->rowFormat === null) {
+            return "DEFAULT CHARACTER SET {$this->charset} COLLATE {$this->collate}";
+        }
+
+        $options = "DEFAULT CHARSET={$this->charset} COLLATE={$this->collate}";
+
+        if ($this->engine !== null) {
+            $options = "ENGINE={$this->engine} {$options}";
+        }
+
+        if ($this->rowFormat !== null) {
+            $options .= " ROW_FORMAT={$this->rowFormat}";
+        }
+
+        return $options;
+    }
+
     public function compile(string $tableName): string
     {
         $defs = [];
@@ -286,6 +394,16 @@ class Table
 
             if ($def['unsigned']) {
                 $line .= ' unsigned';
+            }
+
+            // MySQL only accepts the character set between the type and the NULL
+            // constraint; after NOT NULL it is a syntax error.
+            if ($def['charset']) {
+                $line .= ' CHARACTER SET ' . $def['charset'];
+
+                if ($def['collate']) {
+                    $line .= ' COLLATE ' . $def['collate'];
+                }
             }
 
             if (!$def['nullable']) {
@@ -309,7 +427,15 @@ class Table
             $defs[] = $line;
 
             if ($def['primary']) {
-                $constraints[] = "PRIMARY KEY  ({$this->quoteIdentifier($def['name'])})";
+                if (!$this->compositePrimary) {
+                    $constraints[] = "PRIMARY KEY  ({$this->quoteIdentifier($def['name'])})";
+                } elseif ($def['autoIncrement'] && !in_array($def['name'], $this->compositePrimary, true)) {
+                    // Suppressing this column's primary key would leave the auto
+                    // increment column in no key at all, which is MySQL error 1075.
+                    throw new InvalidArgumentException(
+                        "Auto increment column {$def['name']} must be part of the composite primary key"
+                    );
+                }
             }
 
             // Column-level unique() becomes a separate UNIQUE KEY line (like
@@ -327,6 +453,11 @@ class Table
                 }
                 $constraints[] = $fk;
             }
+        }
+
+        if ($this->compositePrimary) {
+            $colsList = implode(', ', array_map(fn ($c) => $this->quoteIdentifier($c), $this->compositePrimary));
+            array_unshift($constraints, "PRIMARY KEY ({$colsList})");
         }
 
         foreach ($this->columns as $col) {
@@ -352,7 +483,7 @@ class Table
         $all = array_merge($defs, $constraints);
 
         // dbDelta() requires each column on its own line
-        return "CREATE TABLE {$tableName} (\n" . implode(",\n", $all) . "\n) DEFAULT CHARACTER SET {$this->charset} COLLATE {$this->collate}";
+        return "CREATE TABLE {$tableName} (\n" . implode(",\n", $all) . "\n) " . $this->tableOptions();
     }
 
     public function compileMetaTable(string $tableName, string $prefix = ''): string
@@ -378,6 +509,6 @@ class Table
             . "PRIMARY KEY  (meta_id),\n"
             . "KEY {$singularId} ({$singularId}),\n"
             . "KEY meta_key (meta_key)\n"
-            . ") DEFAULT CHARACTER SET {$this->charset} COLLATE {$this->collate}";
+            . ') ' . $this->tableOptions();
     }
 }

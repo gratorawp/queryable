@@ -16,6 +16,9 @@ abstract class Model implements ArrayAccess
     protected string $primaryKey = 'id';
     protected string $version = '1.0.0';
 
+    /** [charset, collate]. Left empty, the table falls back to whatever $wpdb reports. */
+    protected array $collation = [];
+
     private array $extras = [];
     private static array $schemas = [];
 
@@ -239,27 +242,7 @@ abstract class Model implements ArrayAccess
         $pk = $this->primaryKey;
         $raw = $this->toArray();
         $isUpdate = !empty($raw[$pk]);
-
-        $colMeta = static::columnMeta();
-        $nullable = $colMeta['nullable'];
-
-        // Drop null values, except an explicit null assigned to a nullable
-        $data = [];
-        foreach ($raw as $col => $value) {
-            if ($value === null) {
-                if ($isUpdate && in_array($col, $nullable, true)) {
-                    $data[$col] = null;
-                }
-                continue;
-            }
-            $data[$col] = $value;
-        }
-
-        foreach ($colMeta['json'] as $col) {
-            if (isset($data[$col]) && is_array($data[$col])) {
-                $data[$col] = json_encode($data[$col], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-            }
-        }
+        $data = $this->writableData($raw, $isUpdate);
 
         $builder = static::newBuilder();
 
@@ -287,6 +270,52 @@ abstract class Model implements ArrayAccess
         return $result;
     }
 
+    /**
+     * Writes every column the model holds without consulting the primary key,
+     * which is the only correct write for a table whose key is supplied rather
+     * than generated. A create-or-update on such a table has to be stated in
+     * SQL, because nothing here can make a read and a write atomic.
+     */
+    public function insert(): QueryResult
+    {
+        $this->onBeforeSave();
+
+        $result = static::newBuilder()->insert($this->writableData($this->toArray(), false));
+
+        $this->onSave();
+
+        return $result;
+    }
+
+    /**
+     * A null is dropped rather than written, so an unset property does not
+     * overwrite a column that has a default. An update keeps a null that
+     * belongs to a nullable column, which is the only way to clear one.
+     */
+    private function writableData(array $raw, bool $keepNulls): array
+    {
+        $colMeta = static::columnMeta();
+
+        $data = [];
+        foreach ($raw as $col => $value) {
+            if ($value === null) {
+                if ($keepNulls && in_array($col, $colMeta['nullable'], true)) {
+                    $data[$col] = null;
+                }
+                continue;
+            }
+            $data[$col] = $value;
+        }
+
+        foreach ($colMeta['json'] as $col) {
+            if (isset($data[$col]) && is_array($data[$col])) {
+                $data[$col] = json_encode($data[$col], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            }
+        }
+
+        return $data;
+    }
+
     public function toArray(): array
     {
         // get only public props
@@ -300,6 +329,55 @@ abstract class Model implements ArrayAccess
         static::$schemas[static::class] = $callback;
     }
 
+    /**
+     * Lets a consumer compile a model's DDL without migrating it, which is how a
+     * golden-DDL test locks a schema down. The alternative is reflecting into
+     * this class's privates.
+     */
+    public static function schemaFor(string $class): ?Closure
+    {
+        return self::$schemas[$class] ?? null;
+    }
+
+    /**
+     * The DDL migrate would run, without running it. A golden-DDL test that
+     * compiled through its own path would lock down bytes migration never
+     * executes, so both go through here.
+     */
+    public static function compileSchema(): string
+    {
+        return static::schemaBuilder()->compile(static::qualifiedTable());
+    }
+
+    public static function qualifiedTable(): string
+    {
+        global $wpdb;
+
+        return ($wpdb->prefix ?? '') . (new static())->table;
+    }
+
+    private static function schemaBuilder(): Table
+    {
+        global $wpdb;
+
+        $callback = self::$schemas[static::class] ?? null;
+
+        if (!$callback) {
+            throw new RuntimeException('No schema defined for ' . static::class . '. Call ' . static::class . '::schema() first.');
+        }
+
+        $model = new static();
+        // ?: and not ??, as wpdb reports an empty string when the install has no collation configured,
+        // which is the default under SQLite, and that emitted a trailing "COLLATE " no engine will parse.
+        $charset = $model->collation[0] ?? ($wpdb->charset ?: 'utf8mb4');
+        $collate = $model->collation[1] ?? ($wpdb->collate ?: 'utf8mb4_unicode_ci');
+
+        $builder = new Table($charset, $collate, $model->meta());
+        $callback($builder);
+
+        return $builder;
+    }
+
     public static function migrate(bool $force = false): void
     {
         global $wpdb;
@@ -311,33 +389,39 @@ abstract class Model implements ArrayAccess
             return;
         }
 
-        $callback = static::$schemas[static::class] ?? null;
-
-        if (!$callback) {
-            throw new RuntimeException('No schema defined for ' . static::class . '. Call ' . static::class . '::schema() first.');
-        }
-
         $prefix = $wpdb->prefix ?? '';
-        $fullName = $prefix . $model->table;
-        // ?? only catches null. wpdb reports an empty string when the install has
-        // no collation configured, which is the default under SQLite, and that
-        // emitted a trailing "COLLATE " that no engine will parse.
-        $charset = $wpdb->charset ?: 'utf8mb4';
-        $collate = $wpdb->collate ?: 'utf8mb4_unicode_ci';
+        $fullName = static::qualifiedTable();
+
+        $sqls = [static::compileSchema() . ';'];
 
         $meta = $model->meta();
-        $tableBuilder = new Table($charset, $collate, $meta);
-        $callback($tableBuilder);
-
-        $sqls = [$tableBuilder->compile($fullName) . ';'];
 
         if (!empty($meta)) {
-            $sqls[] = $tableBuilder->compileMetaTable($fullName, $prefix) . ';';
+            $sqls[] = static::schemaBuilder()->compileMetaTable($fullName, $prefix) . ';';
         }
 
         dbDelta(implode("\n", $sqls));
 
+        // dbDelta() reports nothing usable when a CREATE is rejected, so recording
+        // the version blind would latch a failed migration as a completed one and
+        // never retry it without force.
+        if (!self::tableExists($fullName)) {
+            return;
+        }
+
         update_option($optionKey, $model->version);
+    }
+
+    /**
+     * SHOW TABLES rather than information_schema: it is the one probe that
+     * ignores the temporary tables a test harness may have substituted, so it
+     * answers the question migration gating actually asks.
+     */
+    public static function tableExists(string $table): bool
+    {
+        global $wpdb;
+
+        return $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $wpdb->esc_like($table))) === $table;
     }
 
     public static function transaction(callable $callback): mixed
